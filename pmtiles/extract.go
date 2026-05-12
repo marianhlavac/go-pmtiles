@@ -9,12 +9,14 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/paulmach/orb"
 	"golang.org/x/sync/errgroup"
+	"gocloud.dev/blob"
 	"io"
 	"io/ioutil"
 	"log"
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -231,6 +233,99 @@ func mergeRanges(ranges []srcDstRange, overfetch float32) (*list.List, uint64) {
 	}
 
 	return result, totalBytes
+}
+
+// parseCloudOutput parses a cloud URL and returns (bucketURL, key, true).
+// Returns ("", "", false) for local paths and "-" (stdout).
+// Supports s3://<bucket>/<key>, gs://<bucket>/<key>, azblob://<container>/<key>.
+func parseCloudOutput(output string) (string, string, bool) {
+	for _, scheme := range []string{"s3://", "gs://", "azblob://"} {
+		if strings.HasPrefix(output, scheme) {
+			rest := strings.TrimPrefix(output, scheme)
+			idx := strings.IndexByte(rest, '/')
+			if idx < 0 {
+				return scheme + rest, "", true
+			}
+			return scheme + rest[:idx], rest[idx+1:], true
+		}
+	}
+	return "", "", false
+}
+
+// extractStreaming writes a complete PMTiles archive sequentially to w.
+// All offsets are pre-computed so the header is written first — no seeking needed.
+// Tile ranges are written in ascending DstOffset order (mergeRanges returns them
+// sorted by Length DESC for parallel workers, so re-sorting is required here).
+func extractStreaming(
+	ctx context.Context,
+	logger *log.Logger,
+	srcBucket Bucket,
+	srcKey string,
+	sourceMetadataOffset uint64,
+	sourceTileDataOffset uint64,
+	header HeaderV3,
+	headerBytes []byte,
+	newRootBytes []byte,
+	newLeavesBytes []byte,
+	overfetchRanges *list.List,
+	totalBytes uint64,
+	w io.Writer,
+) error {
+	if _, err := w.Write(headerBytes); err != nil {
+		return fmt.Errorf("writing header: %w", err)
+	}
+	if _, err := w.Write(newRootBytes); err != nil {
+		return fmt.Errorf("writing root directory: %w", err)
+	}
+
+	metadataReader, err := srcBucket.NewRangeReader(ctx, srcKey,
+		int64(sourceMetadataOffset), int64(header.MetadataLength))
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(w, metadataReader); err != nil {
+		metadataReader.Close()
+		return fmt.Errorf("writing metadata: %w", err)
+	}
+	metadataReader.Close()
+
+	if _, err := w.Write(newLeavesBytes); err != nil {
+		return fmt.Errorf("writing leaf directories: %w", err)
+	}
+
+	// Re-sort by DstOffset for sequential streaming.
+	// mergeRanges returns ranges sorted by Length DESC.
+	sortedRanges := make([]overfetchRange, 0, overfetchRanges.Len())
+	for e := overfetchRanges.Front(); e != nil; e = e.Next() {
+		sortedRanges = append(sortedRanges, e.Value.(overfetchRange))
+	}
+	sort.Slice(sortedRanges, func(i, j int) bool {
+		return sortedRanges[i].Rng.DstOffset < sortedRanges[j].Rng.DstOffset
+	})
+
+	bar := defaultBytesProgressbar(logger, int64(totalBytes), "fetching chunks")
+
+	for _, or := range sortedRanges {
+		tileReader, err := srcBucket.NewRangeReader(ctx, srcKey,
+			int64(sourceTileDataOffset+or.Rng.SrcOffset), int64(or.Rng.Length))
+		if err != nil {
+			return err
+		}
+		for _, cd := range or.CopyDiscards {
+			if _, err := io.CopyN(io.MultiWriter(w, bar), tileReader, int64(cd.Wanted)); err != nil {
+				tileReader.Close()
+				return fmt.Errorf("writing tile data: %w", err)
+			}
+			if cd.Discard > 0 {
+				if _, err := io.CopyN(bar, tileReader, int64(cd.Discard)); err != nil {
+					tileReader.Close()
+					return fmt.Errorf("discarding overfetch: %w", err)
+				}
+			}
+		}
+		tileReader.Close()
+	}
+	return nil
 }
 
 // Extract a smaller archive from local or remote archive.
@@ -454,124 +549,175 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	}
 
 	if !dryRun {
+		outBucketURL, outKey, isCloud := parseCloudOutput(output)
+		isStdout := output == "-"
 
-		outfile, err := os.Create(output)
-		defer outfile.Close()
+		if isStdout || isCloud {
+			logger.Printf("Using streamed output for %s\n", output)
 
-		if err != nil {
-			return err
-		}
+			if downloadThreads > 1 {
+				logger.Printf("Warning: --download-threads ignored for streaming output\n")
+			}
 
-		// set the file size and write empty space for the header for now
-		// see comment below
-		outfile.Truncate(HeaderV3LenBytes + int64(len(newRootBytes)) + int64(header.MetadataLength) + int64(len(newLeavesBytes)) + int64(totalActualBytes))
-		_, err = outfile.Write(make([]byte, HeaderV3LenBytes))
-		if err != nil {
-			return err
-		}
+			if isStdout {
+				if err := extractStreaming(ctx, logger, bucket, key,
+					sourceMetadataOffset, sourceTileDataOffset,
+					header, headerBytes, newRootBytes, newLeavesBytes,
+					overfetchRanges, totalBytes, os.Stdout); err != nil {
+					return err
+				}
+			} else {
+				outBucket, err := blob.OpenBucket(ctx, outBucketURL)
+				if err != nil {
+					return fmt.Errorf("Failed to open output bucket %s: %w", outBucketURL, err)
+				}
+				defer outBucket.Close()
 
-		// 8. write the root directory
-		_, err = outfile.Write(newRootBytes)
-		if err != nil {
-			return err
-		}
+				totalOutputSize := int64(HeaderV3LenBytes) +
+					int64(len(newRootBytes)) +
+					int64(header.MetadataLength) +
+					int64(len(newLeavesBytes)) +
+					int64(totalActualBytes)
 
-		// 9. get and write the metadata
-		metadataReader, err := bucket.NewRangeReader(ctx, key, int64(sourceMetadataOffset), int64(header.MetadataLength))
-		if err != nil {
-			return err
-		}
-		metadataBytes, err := io.ReadAll(metadataReader)
-		defer metadataReader.Close()
-		if err != nil {
-			return err
-		}
+				w, err := outBucket.NewWriter(ctx, outKey, &blob.WriterOptions{
+					BufferSize: partSizeBytes(totalOutputSize),
+				})
+				if err != nil {
+					return fmt.Errorf("Failed to create cloud writer for %s/%s: %w", outBucketURL, outKey, err)
+				}
 
-		_, err = outfile.Write(metadataBytes)
-		if err != nil {
-			return err
-		}
+				writeErr := extractStreaming(ctx, logger, bucket, key,
+					sourceMetadataOffset, sourceTileDataOffset,
+					header, headerBytes, newRootBytes, newLeavesBytes,
+					overfetchRanges, totalBytes, w)
 
-		// 10. write the leaf directories
-		_, err = outfile.Write(newLeavesBytes)
-		if err != nil {
-			return err
-		}
+				// Always call w.Close(): commits on success, aborts S3 multipart upload on error.
+				if closeErr := w.Close(); closeErr != nil && writeErr == nil {
+					return fmt.Errorf("Failed to commit cloud upload: %w", closeErr)
+				}
+				if writeErr != nil {
+					return writeErr
+				}
+			}
+		} else {
+			outfile, err := os.Create(output)
+			defer outfile.Close()
 
-		bar := defaultBytesProgressbar(
-			logger,
-			int64(totalBytes),
-			"fetching chunks",
-		)
-
-		var mu sync.Mutex
-
-		downloadPart := func(or overfetchRange) error {
-			tileReader, err := bucket.NewRangeReader(ctx, key, int64(sourceTileDataOffset+or.Rng.SrcOffset), int64(or.Rng.Length))
 			if err != nil {
 				return err
 			}
-			offsetWriter := io.NewOffsetWriter(outfile, int64(header.TileDataOffset)+int64(or.Rng.DstOffset))
 
-			for _, cd := range or.CopyDiscards {
-
-				_, err := io.CopyN(io.MultiWriter(offsetWriter, bar), tileReader, int64(cd.Wanted))
-				if err != nil {
-					return err
-				}
-
-				_, err = io.CopyN(bar, tileReader, int64(cd.Discard))
-				if err != nil {
-					return err
-				}
+			// set the file size and write empty space for the header for now
+			// see comment below
+			outfile.Truncate(HeaderV3LenBytes + int64(len(newRootBytes)) + int64(header.MetadataLength) + int64(len(newLeavesBytes)) + int64(totalActualBytes))
+			_, err = outfile.Write(make([]byte, HeaderV3LenBytes))
+			if err != nil {
+				return err
 			}
-			tileReader.Close()
-			return nil
-		}
 
-		errs, _ := errgroup.WithContext(ctx)
+			// 8. write the root directory
+			_, err = outfile.Write(newRootBytes)
+			if err != nil {
+				return err
+			}
 
-		for i := 0; i < downloadThreads; i++ {
-			workBack := (i == 0 && downloadThreads > 1)
-			errs.Go(func() error {
-				done := false
-				var or overfetchRange
-				for {
-					mu.Lock()
-					if overfetchRanges.Len() == 0 {
-						done = true
-					} else {
-						if workBack {
-							or = overfetchRanges.Remove(overfetchRanges.Back()).(overfetchRange)
-						} else {
-							or = overfetchRanges.Remove(overfetchRanges.Front()).(overfetchRange)
-						}
+			// 9. get and write the metadata
+			metadataReader, err := bucket.NewRangeReader(ctx, key, int64(sourceMetadataOffset), int64(header.MetadataLength))
+			if err != nil {
+				return err
+			}
+			metadataBytes, err := io.ReadAll(metadataReader)
+			defer metadataReader.Close()
+			if err != nil {
+				return err
+			}
+
+			_, err = outfile.Write(metadataBytes)
+			if err != nil {
+				return err
+			}
+
+			// 10. write the leaf directories
+			_, err = outfile.Write(newLeavesBytes)
+			if err != nil {
+				return err
+			}
+
+			bar := defaultBytesProgressbar(
+				logger,
+				int64(totalBytes),
+				"fetching chunks",
+			)
+
+			var mu sync.Mutex
+
+			downloadPart := func(or overfetchRange) error {
+				tileReader, err := bucket.NewRangeReader(ctx, key, int64(sourceTileDataOffset+or.Rng.SrcOffset), int64(or.Rng.Length))
+				if err != nil {
+					return err
+				}
+				offsetWriter := io.NewOffsetWriter(outfile, int64(header.TileDataOffset)+int64(or.Rng.DstOffset))
+
+				for _, cd := range or.CopyDiscards {
+
+					_, err := io.CopyN(io.MultiWriter(offsetWriter, bar), tileReader, int64(cd.Wanted))
+					if err != nil {
+						return err
 					}
-					mu.Unlock()
-					if done {
-						return nil
-					}
-					err := downloadPart(or)
+
+					_, err = io.CopyN(bar, tileReader, int64(cd.Discard))
 					if err != nil {
 						return err
 					}
 				}
-			})
-		}
+				tileReader.Close()
+				return nil
+			}
 
-		err = errs.Wait()
-		if err != nil {
-			return err
-		}
+			errs, _ := errgroup.WithContext(ctx)
 
-		// Write the header when finishing,
-		// otherwise a extract cancelled during the tile download section
-		// will appear valid with "pmtiles verify"
-		// even though the tile contents are corrupted.
-		outfile.Seek(0, io.SeekStart)
-		_, err = outfile.Write(headerBytes)
-		if err != nil {
-			return err
+			for i := 0; i < downloadThreads; i++ {
+				workBack := (i == 0 && downloadThreads > 1)
+				errs.Go(func() error {
+					done := false
+					var or overfetchRange
+					for {
+						mu.Lock()
+						if overfetchRanges.Len() == 0 {
+							done = true
+						} else {
+							if workBack {
+								or = overfetchRanges.Remove(overfetchRanges.Back()).(overfetchRange)
+							} else {
+								or = overfetchRanges.Remove(overfetchRanges.Front()).(overfetchRange)
+							}
+						}
+						mu.Unlock()
+						if done {
+							return nil
+						}
+						err := downloadPart(or)
+						if err != nil {
+							return err
+						}
+					}
+				})
+			}
+
+			err = errs.Wait()
+			if err != nil {
+				return err
+			}
+
+			// Write the header when finishing,
+			// otherwise a extract cancelled during the tile download section
+			// will appear valid with "pmtiles verify"
+			// even though the tile contents are corrupted.
+			outfile.Seek(0, io.SeekStart)
+			_, err = outfile.Write(headerBytes)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

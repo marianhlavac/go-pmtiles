@@ -61,7 +61,7 @@ var cli struct {
 
 	Extract struct {
 		Input           string  `arg:"" help:"Input local or remote archive"`
-		Output          string  `arg:"" help:"Output archive" type:"path"`
+		Output          string  `arg:"" help:"Output local path, cloud URL (e.g. s3://bucket/file.pmtiles, gs://bucket/file.pmtiles, azblob://container/file.pmtiles), or - for stdout"`
 		Bucket          string  `help:"Remote bucket of input archive"`
 		Region          string  `help:"local GeoJSON Polygon or MultiPolygon file for area of interest" type:"existingfile"`
 		Bbox            string  `help:"bbox area of interest: min_lon,min_lat,max_lon,max_lat" type:"string"`
