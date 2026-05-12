@@ -1,9 +1,16 @@
 package pmtiles
 
 import (
+	"bytes"
+	"context"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"testing"
+
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/stretchr/testify/assert"
-	"testing"
 )
 
 func TestRelevantEntries(t *testing.T) {
@@ -172,4 +179,65 @@ func TestMergeRangesNonSrcOrdered(t *testing.T) {
 
 	result, _ := mergeRanges(ranges, 0.1)
 	assert.Equal(t, 2, result.Len())
+}
+
+func TestParseCloudOutput(t *testing.T) {
+	bucketURL, key, isCloud := parseCloudOutput("s3://mybucket/path/to/file.pmtiles")
+	assert.True(t, isCloud)
+	assert.Equal(t, "s3://mybucket", bucketURL)
+	assert.Equal(t, "path/to/file.pmtiles", key)
+
+	bucketURL, key, isCloud = parseCloudOutput("gs://mybucket/file.pmtiles")
+	assert.True(t, isCloud)
+	assert.Equal(t, "gs://mybucket", bucketURL)
+	assert.Equal(t, "file.pmtiles", key)
+
+	bucketURL, key, isCloud = parseCloudOutput("azblob://mycontainer/file.pmtiles")
+	assert.True(t, isCloud)
+	assert.Equal(t, "azblob://mycontainer", bucketURL)
+	assert.Equal(t, "file.pmtiles", key)
+
+	_, _, isCloud = parseCloudOutput("/local/path/file.pmtiles")
+	assert.False(t, isCloud)
+
+	_, _, isCloud = parseCloudOutput("-")
+	assert.False(t, isCloud)
+}
+
+// TestExtractStreamingToStdout tests the streaming code path by capturing stdout.
+// It clusters the unclustered fixture, extracts it to stdout, and verifies the result.
+func TestExtractStreamingToStdout(t *testing.T) {
+	ctx := context.Background()
+	silentLogger := log.New(io.Discard, "", 0)
+
+	// Extract requires a clustered source; cluster the fixture into a temp file.
+	clusteredPath := makeFixtureCopy(t, "unclustered", "clustered_for_stream_test")
+	err := Cluster(logger, clusteredPath, true)
+	assert.NoError(t, err)
+
+	// Capture stdout via a pipe
+	origStdout := os.Stdout
+	pr, pw, err := os.Pipe()
+	assert.NoError(t, err)
+	os.Stdout = pw
+
+	extractErr := Extract(ctx, silentLogger, "", clusteredPath, -1, -1, "", "", "-", 1, 0.0, false)
+
+	pw.Close()
+	os.Stdout = origStdout
+
+	assert.NoError(t, extractErr)
+
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, pr)
+	assert.NoError(t, err)
+	pr.Close()
+
+	// Write captured bytes to a temp file and verify the archive is valid
+	outPath := filepath.Join(t.TempDir(), "out.pmtiles")
+	err = os.WriteFile(outPath, buf.Bytes(), 0644)
+	assert.NoError(t, err)
+
+	err = Verify(silentLogger, outPath)
+	assert.NoError(t, err)
 }
